@@ -1,5 +1,5 @@
 """
-Agent tools for search, weather, and directions.
+Agent tools for search, weather, directions, time, and currency exchange.
 
 Each tool is a Strands @tool decorated function that the agent can invoke.
 Tools are kept in this separate module so they can be:
@@ -11,9 +11,12 @@ All tool log messages are prefixed with [Tool] for easy filtering in debug.log:
     grep "\\[Tool\\]" debug.log
 """
 
+from datetime import datetime
 import json
 import logging
+import re
 import time
+from zoneinfo import ZoneInfo
 
 import requests
 from ddgs import DDGS
@@ -32,8 +35,35 @@ logger = logging.getLogger(__name__)
 NOMINATIM_BASE_URL = "https://nominatim.openstreetmap.org/search"
 OSRM_BASE_URL = "https://router.project-osrm.org/route/v1/driving"
 OPEN_METEO_BASE_URL = "https://api.open-meteo.com/v1/forecast"
+FRANKFURTER_BASE_URL = "https://api.frankfurter.app/latest"
 NOMINATIM_USER_AGENT = "simple-agent-evals/1.0"
 HTTP_TIMEOUT_SECONDS = 10
+CITY_TIMEZONE_MAP = {
+    "anchorage": "America/Anchorage",
+    "austin": "America/Chicago",
+    "baltimore": "America/New_York",
+    "boston": "America/New_York",
+    "chicago": "America/Chicago",
+    "denver": "America/Denver",
+    "georgetown": "America/New_York",
+    "honolulu": "Pacific/Honolulu",
+    "jfk": "America/New_York",
+    "london": "Europe/London",
+    "los angeles": "America/Los_Angeles",
+    "miami": "America/New_York",
+    "milwaukee": "America/Chicago",
+    "nashville": "America/Chicago",
+    "new york": "America/New_York",
+    "new york city": "America/New_York",
+    "nyc": "America/New_York",
+    "paris": "Europe/Paris",
+    "san francisco": "America/Los_Angeles",
+    "seattle": "America/Los_Angeles",
+    "sydney": "Australia/Sydney",
+    "tokyo": "Asia/Tokyo",
+    "washington dc": "America/New_York",
+    "washington, dc": "America/New_York",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +151,77 @@ def _format_distance(
     """
     miles = distance_meters / 1609.34
     return f"{miles:.1f} miles"
+
+
+def _normalize_city_name(
+    city: str
+) -> str:
+    """
+    Normalize a city string for timezone lookup.
+
+    Args:
+        city: User-provided city name
+
+    Returns:
+        Normalized lowercase city name
+    """
+    return re.sub(r"\s+", " ", city.strip().lower())
+
+
+def _lookup_timezone(
+    city: str
+) -> str:
+    """
+    Look up an IANA timezone identifier for a city.
+
+    Args:
+        city: City name such as 'Tokyo' or 'New York'
+
+    Returns:
+        IANA timezone identifier
+    """
+    normalized_city = _normalize_city_name(city)
+    timezone_name = CITY_TIMEZONE_MAP.get(normalized_city)
+
+    if not timezone_name:
+        raise ValueError(f"City not found in timezone map: {city}")
+
+    return timezone_name
+
+
+def _format_utc_offset(
+    offset_value: str
+) -> str:
+    """
+    Format an offset like +0900 as +09:00.
+
+    Args:
+        offset_value: Offset string from strftime('%z')
+
+    Returns:
+        Formatted offset string
+    """
+    if len(offset_value) == 5:
+        return f"{offset_value[:3]}:{offset_value[3:]}"
+    return offset_value
+
+
+def _normalize_currency_code(
+    currency_code: str
+) -> str:
+    """
+    Normalize and validate an ISO 4217 currency code.
+
+    Args:
+        currency_code: Currency code such as usd or EUR
+
+    Returns:
+        Uppercase currency code
+    """
+    normalized_code = currency_code.strip().upper()
+    if not re.fullmatch(r"[A-Z]{3}", normalized_code):
+        raise ValueError(f"Invalid currency code: {currency_code}")
+    return normalized_code
 
 
 # ---------------------------------------------------------------------------
@@ -281,4 +382,108 @@ def get_directions(
 
     except Exception as e:
         logger.error(f"[Tool] get_directions failed: {e}")
+        return json.dumps({"error": str(e)})
+
+
+@tool
+def get_current_time(
+    city: str
+) -> str:
+    """
+    Get the current local time for a supported city using Python's zoneinfo.
+
+    Args:
+        city: City name such as 'Tokyo', 'New York', or 'London'
+
+    Returns:
+        JSON string with local time, timezone abbreviation, and UTC offset
+    """
+    try:
+        logger.info(f"[Tool] get_current_time: city='{city}'")
+
+        timezone_name = _lookup_timezone(city)
+        now = datetime.now(ZoneInfo(timezone_name))
+
+        time_info = {
+            "city": city,
+            "timezone": timezone_name,
+            "local_time": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "timezone_abbreviation": now.strftime("%Z"),
+            "utc_offset": _format_utc_offset(now.strftime("%z")),
+        }
+
+        logger.info(
+            f"[Tool] get_current_time: {city} -> "
+            f"{time_info['local_time']} {time_info['timezone_abbreviation']}"
+        )
+        return json.dumps(time_info, indent=2)
+
+    except Exception as e:
+        logger.error(f"[Tool] get_current_time failed: {e}")
+        return json.dumps({"error": str(e)})
+
+
+@tool
+def get_exchange_rate(
+    base_currency: str,
+    target_currency: str,
+    amount: float = 1.0
+) -> str:
+    """
+    Get the latest exchange rate and converted amount from Frankfurter.
+
+    Args:
+        base_currency: Base ISO 4217 currency code such as USD
+        target_currency: Target ISO 4217 currency code such as EUR
+        amount: Amount in the base currency to convert
+
+    Returns:
+        JSON string with rate, converted amount, and date
+    """
+    try:
+        logger.info(
+            f"[Tool] get_exchange_rate: {base_currency} -> {target_currency}, amount={amount}"
+        )
+
+        base_code = _normalize_currency_code(base_currency)
+        target_code = _normalize_currency_code(target_currency)
+
+        response = requests.get(
+            FRANKFURTER_BASE_URL,
+            params={
+                "from": base_code,
+                "to": target_code,
+            },
+            timeout=HTTP_TIMEOUT_SECONDS,
+        )
+
+        if not response.ok:
+            raise ValueError(
+                f"Frankfurter API error ({response.status_code}): {response.text.strip()}"
+            )
+
+        data = response.json()
+        rate = data.get("rates", {}).get(target_code)
+
+        if rate is None:
+            raise ValueError(
+                f"Exchange rate not found for {base_code} to {target_code}"
+            )
+
+        exchange_info = {
+            "base_currency": base_code,
+            "target_currency": target_code,
+            "amount": amount,
+            "exchange_rate": rate,
+            "converted_amount": round(amount * rate, 4),
+            "date": data.get("date"),
+        }
+
+        logger.info(
+            f"[Tool] get_exchange_rate: 1 {base_code} = {rate} {target_code}"
+        )
+        return json.dumps(exchange_info, indent=2)
+
+    except Exception as e:
+        logger.error(f"[Tool] get_exchange_rate failed: {e}")
         return json.dumps({"error": str(e)})
